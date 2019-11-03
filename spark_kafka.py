@@ -5,14 +5,20 @@ import math, time, json
 from kafka import KafkaConsumer
 import redis
 from pymongo import MongoClient
+
+# connect mongoDB
 client = MongoClient(host="10.120.28.5", port=27017)
 db = client['123']
 music = db.music
+
+# connect redis
 r = redis.Redis(host='10.120.28.22', port=6379)
 
+# load model
 model_path = "/home/cloudera/Desktop/datasets/music/music_lens_als"
 same_model = MatrixFactorizationModel.load(sc, model_path)
-# load data
+
+# load rating data
 complete_ratings_raw_data = sc.textFile("/home/cloudera/Desktop/datasets/music/ff2_data.csv")
 # set column names
 complete_ratings_raw_data_header = complete_ratings_raw_data.take(1)[0]
@@ -23,6 +29,7 @@ complete_ratings_raw_data_header = complete_ratings_raw_data.take(1)[0]
 complete_ratings_data = complete_ratings_raw_data.filter(lambda line: line!=complete_ratings_raw_data_header).map(lambda line: line.split(",")).map(lambda tokens: (int(tokens[0]),int(tokens[1]),float(tokens[2]))).cache()
 print("There are %s recommendations in the complete dataset" % (complete_ratings_data.count()))
 
+# set model's parameter
 seed = 5
 iterations = 10
 regularization_parameter = 0.1
@@ -34,7 +41,7 @@ min_error = float('inf')
 best_rank = 4
 best_iteration = -1
 
-# load music neta data
+# load music meta data
 complete_music_raw_data = sc.textFile("/home/cloudera/Desktop/datasets/music/songs_metadata_file_new.csv")
 complete_music_raw_data_header = complete_music_raw_data.take(1)[0]
 complete_music_data = complete_music_raw_data.filter(lambda line: line!=complete_music_raw_data_header).map(lambda line: line.split(",")).map(lambda tokens: (int(tokens[0]),tokens[1],tokens[2])).cache()
@@ -64,10 +71,12 @@ consumer = KafkaConsumer(
 
 # 讓Consumer向Kafka集群訂閱指定的topic
 consumer.subscribe(topics="music4")
+
+# build a list for consumer's data
 new_user_ratings = []
-# 持續的拉取Kafka有進來的訊息
-print("Now listening for incoming messages ...")
-# 持續監控是否有新的record進來
+
+# start consuming data from kafka
+# data sample: "{'userid': 123465, 'music':('m1',5124), 'rating': 5}"
 for record in consumer:
     msgValue = eval(record.value) 
     new_user_ID = msgValue['userid'] 
@@ -79,14 +88,14 @@ for record in consumer:
     new_user_ratings.append(data) 
     if song_index != 'm3': 
         continue 
-    else: 
+    else:  # start model and get music list when getting m3's data 
         print(new_user_ratings)
+        # transfer data into RDD
         new_user_ratings_RDD = sc.parallelize(new_user_ratings)
-        
-        print('New user ratings: %s' % new_user_ratings_RDD.take(3))
         # merge new data into old data
         complete_data_with_new_ratings_RDD = complete_ratings_data.union(new_user_ratings_RDD)
-        # train model again with new data
+        
+        # remodel with new data
         from time import time
         t0 = time()
         new_ratings_model = ALS.train(complete_data_with_new_ratings_RDD, best_rank, seed=seed, iterations=iterations, lambda_=regularization_parameter)
@@ -109,10 +118,14 @@ for record in consumer:
         # sort data by rating score and list first 25 data
         top_musics = new_user_recommendations_rating_title_and_count_RDD.filter(lambda r: r[2]>=25).takeOrdered(25, key=lambda x: -x[1])
         print('TOP recommended musics (with more than 25 reviews):\n%s' % '\n'.join(map(str, top_musics)))
+        
+        # send music list to redis and mongodb
         result_r = r.hset('music', new_user_ID, str(top_musics))
         j = {'user': new_user_ID, 'music': top_musics}
         result_m = music.insert_one(j)
-        new_user_ratings = []
         print(result_r, result_m, new_user_ratings)
+        
+        # reset list
+        new_user_ratings = []
 
 
